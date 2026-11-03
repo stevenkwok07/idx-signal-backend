@@ -81,6 +81,7 @@ def fetch_history(ticker: str, force_refresh: bool = False):
     regular_market_time = raw_metadata.get("regularMarketTime")
     regular_market_time_utc = None
     regular_market_date = None
+    provider_time = None
     try:
         if isinstance(regular_market_time, (int, float)) and regular_market_time > 0:
             provider_time = pd.Timestamp(regular_market_time, unit="s", tz="UTC")
