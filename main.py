@@ -1,6 +1,7 @@
 import os
 import logging
-from functools import lru_cache
+import threading
+import time
 from datetime import datetime, timezone
 
 import numpy as np
@@ -21,8 +22,12 @@ TICKERS = [
     "ACES.JK", "MAPI.JK", "LPPF.JK", "ERAA.JK", "HEAL.JK",
 ]
 
-app = FastAPI(title="IDX Signal API", version="1.0.0",
+app = FastAPI(title="IDX Signal API", version="1.1.0",
               description="API analisis teknikal saham IDX untuk frontend Netlify.")
+
+CACHE_TTL_SECONDS = max(60, int(os.getenv("CACHE_TTL_SECONDS", "900")))
+_history_cache: dict[str, tuple[float, pd.DataFrame, str]] = {}
+_cache_lock = threading.Lock()
 
 # Untuk prototipe publik. Untuk produksi, batasi allow_origins ke domain Netlify milikmu.
 origins_env = os.getenv("CORS_ORIGINS", "*")
@@ -35,6 +40,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def disable_api_response_cache(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 def clean_num(value):
     try:
         value = float(value)
@@ -42,19 +56,32 @@ def clean_num(value):
     except (TypeError, ValueError):
         return None
 
-@lru_cache(maxsize=64)
-def fetch_history(ticker: str):
-    """Cache hasil selama proses berjalan supaya permintaan berulang lebih ringan."""
-    df = yf.Ticker(ticker).history(period="6mo", auto_adjust=True)
+def fetch_history(ticker: str, force_refresh: bool = False):
+    """Ambil history dari cache TTL; cache tidak pernah hidup tanpa batas."""
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _history_cache.get(ticker)
+        if not force_refresh and cached and now - cached[0] < CACHE_TTL_SECONDS:
+            return cached[1], cached[2]
+
+    df = yf.Ticker(ticker).history(period="6mo", auto_adjust=True, actions=False)
     if df is None or df.empty or len(df) < 20:
         raise ValueError(f"Data historis tidak cukup untuk {ticker}")
     df = df.dropna(subset=["Close", "High", "Low"])
     if len(df) < 20:
         raise ValueError(f"Data valid tidak cukup untuk {ticker}")
-    return df
 
-def analyze_ticker(ticker: str):
-    df = fetch_history(ticker)
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    with _cache_lock:
+        _history_cache[ticker] = (time.monotonic(), df, fetched_at)
+    return df, fetched_at
+
+def clear_history_cache():
+    with _cache_lock:
+        _history_cache.clear()
+
+def analyze_ticker(ticker: str, force_refresh: bool = False):
+    df, fetched_at = fetch_history(ticker, force_refresh=force_refresh)
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -168,7 +195,8 @@ def analyze_ticker(ticker: str):
         "trend": trend, "summary": recommendation, "details": details,
         "history": history,
         "data_as_of": df.index[-1].strftime("%Y-%m-%d"),
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "fetched_at": fetched_at,
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "source": "Yahoo Finance via yfinance",
     }
 
@@ -182,20 +210,25 @@ def health():
     return {"status": "ok", "service": "idx-signal-api"}
 
 @app.get("/api/stock/{code}")
-def stock(code: str):
+def stock(code: str, refresh: bool = Query(default=False)):
     ticker = code.upper().strip()
     if not ticker.endswith(".JK"):
         ticker += ".JK"
     if ticker not in TICKERS:
         raise HTTPException(status_code=404, detail="Kode saham belum ada di daftar ticker yang diizinkan.")
     try:
-        return analyze_ticker(ticker)
+        return analyze_ticker(ticker, force_refresh=refresh)
     except Exception as exc:
         log.exception("Gagal menganalisis %s", ticker)
         raise HTTPException(status_code=502, detail=f"Data saham tidak tersedia saat ini untuk {ticker}. Coba lagi nanti.") from exc
 
 @app.get("/api/scan")
-def scan(limit: int = Query(default=30, ge=1, le=30)):
+def scan(
+    limit: int = Query(default=30, ge=1, le=30),
+    refresh: bool = Query(default=False),
+):
+    if refresh:
+        clear_history_cache()
     results, errors = [], []
     for ticker in TICKERS:
         try:
@@ -205,9 +238,16 @@ def scan(limit: int = Query(default=30, ge=1, le=30)):
             log.warning("Skip %s: %s", ticker, exc)
             errors.append(ticker)
     results.sort(key=lambda x: (x["score_percent"], x["momentum_5d_percent"] or -999), reverse=True)
-    return {"count": len(results[:limit]), "unavailable": errors, "results": results[:limit],
-            "data_as_of": max((x["data_as_of"] for x in results), default=None),
-            "note": "Harga historis dari penyedia data; bisa terlambat dan dapat gagal sementara."}
+    return {
+        "count": len(results[:limit]),
+        "unavailable": errors,
+        "results": results[:limit],
+        "data_as_of": max((x["data_as_of"] for x in results), default=None),
+        "fetched_at": max((x["fetched_at"] for x in results), default=None),
+        "cache_ttl_seconds": CACHE_TTL_SECONDS,
+        "refresh_requested": refresh,
+        "note": "Harga historis Yahoo Finance dapat terlambat. Refresh mengambil ulang dari provider, tetapi tidak menjamin provider sudah menerbitkan sesi perdagangan terbaru.",
+    }
 
 @app.get("/api/trend")
 def trend():
@@ -229,7 +269,3 @@ def trend():
     return {"bullish": bullish[:10], "bearish": bearish[:10],
             "sideways": sideways[:10], "unavailable": unavailable}
 
-@app.post("/api/cache/clear")
-def clear_cache():
-    fetch_history.cache_clear()
-    return {"status": "cleared"}
