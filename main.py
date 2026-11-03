@@ -26,7 +26,7 @@ app = FastAPI(title="IDX Signal API", version="1.1.0",
               description="API analisis teknikal saham IDX untuk frontend Netlify.")
 
 CACHE_TTL_SECONDS = max(60, int(os.getenv("CACHE_TTL_SECONDS", "900")))
-_history_cache: dict[str, tuple[float, pd.DataFrame, str]] = {}
+_history_cache: dict[str, tuple[float, pd.DataFrame, str, dict]] = {}
 _cache_lock = threading.Lock()
 
 # Untuk prototipe publik. Untuk produksi, batasi allow_origins ke domain Netlify milikmu.
@@ -57,31 +57,61 @@ def clean_num(value):
         return None
 
 def fetch_history(ticker: str, force_refresh: bool = False):
-    """Ambil history dari cache TTL; cache tidak pernah hidup tanpa batas."""
+    """Ambil candle dan metadata provider; cache memiliki TTL terbatas."""
     now = time.monotonic()
     with _cache_lock:
         cached = _history_cache.get(ticker)
         if not force_refresh and cached and now - cached[0] < CACHE_TTL_SECONDS:
-            return cached[1], cached[2]
+            return cached[1], cached[2], cached[3]
 
-    df = yf.Ticker(ticker).history(period="6mo", auto_adjust=True, actions=False)
+    ticker_client = yf.Ticker(ticker)
+    df = ticker_client.history(period="6mo", interval="1d", auto_adjust=True, actions=False)
     if df is None or df.empty or len(df) < 20:
         raise ValueError(f"Data historis tidak cukup untuk {ticker}")
     df = df.dropna(subset=["Close", "High", "Low"])
     if len(df) < 20:
         raise ValueError(f"Data valid tidak cukup untuk {ticker}")
 
+    try:
+        raw_metadata = ticker_client.history_metadata or {}
+    except Exception as exc:
+        log.warning("Metadata provider tidak tersedia untuk %s: %s", ticker, exc)
+        raw_metadata = {}
+
+    regular_market_time = raw_metadata.get("regularMarketTime")
+    provider_metadata = {
+        "currency": raw_metadata.get("currency"),
+        "exchange_name": raw_metadata.get("exchangeName"),
+        "instrument_type": raw_metadata.get("instrumentType"),
+        "exchange_timezone": raw_metadata.get("exchangeTimezoneName"),
+        "market_state": raw_metadata.get("marketState"),
+        "regular_market_time": regular_market_time,
+        "regular_market_time_utc": (
+            datetime.fromtimestamp(regular_market_time, timezone.utc).isoformat()
+            if isinstance(regular_market_time, (int, float)) and regular_market_time > 0
+            else None
+        ),
+    }
+
     fetched_at = datetime.now(timezone.utc).isoformat()
     with _cache_lock:
-        _history_cache[ticker] = (time.monotonic(), df, fetched_at)
-    return df, fetched_at
+        _history_cache[ticker] = (time.monotonic(), df, fetched_at, provider_metadata)
+    return df, fetched_at, provider_metadata
 
 def clear_history_cache():
     with _cache_lock:
         _history_cache.clear()
 
 def analyze_ticker(ticker: str, force_refresh: bool = False):
-    df, fetched_at = fetch_history(ticker, force_refresh=force_refresh)
+    df, fetched_at, provider_metadata = fetch_history(ticker, force_refresh=force_refresh)
+    last_bar_date = df.index[-1].date()
+    market_today = pd.Timestamp.now(tz="Asia/Jakarta").date()
+    calendar_days_behind = max(0, (market_today - last_bar_date).days)
+    business_days_behind = len(pd.bdate_range(
+        start=last_bar_date + pd.Timedelta(days=1),
+        end=market_today,
+    )) if last_bar_date < market_today else 0
+    stale_suspected = business_days_behind > 1
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -194,8 +224,14 @@ def analyze_ticker(ticker: str, force_refresh: bool = False):
         "score": score, "score_percent": score_pct,
         "trend": trend, "summary": recommendation, "details": details,
         "history": history,
-        "data_as_of": df.index[-1].strftime("%Y-%m-%d"),
+        "data_as_of": last_bar_date.isoformat(),
+        "last_bar_timestamp": df.index[-1].isoformat(),
         "fetched_at": fetched_at,
+        "data_age_calendar_days": calendar_days_behind,
+        "business_days_behind": business_days_behind,
+        "stale_suspected": stale_suspected,
+        "data_status": "STALE_SUSPECTED" if stale_suspected else "OK",
+        "provider_metadata": provider_metadata,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "source": "Yahoo Finance via yfinance",
     }
@@ -243,10 +279,14 @@ def scan(
         "unavailable": errors,
         "results": results[:limit],
         "data_as_of": max((x["data_as_of"] for x in results), default=None),
+        "oldest_data_as_of": min((x["data_as_of"] for x in results), default=None),
         "fetched_at": max((x["fetched_at"] for x in results), default=None),
+        "stale_suspected_count": sum(1 for x in results if x["stale_suspected"]),
+        "stale_tickers": [x["code"] for x in results if x["stale_suspected"]],
+        "data_status": "STALE_SUSPECTED" if any(x["stale_suspected"] for x in results) else "OK",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "refresh_requested": refresh,
-        "note": "Harga historis Yahoo Finance dapat terlambat. Refresh mengambil ulang dari provider, tetapi tidak menjamin provider sudah menerbitkan sesi perdagangan terbaru.",
+        "note": "STALE_SUSPECTED adalah indikator diagnostik berdasarkan hari kerja, bukan kalender resmi bursa. Periksa provider_metadata dan data_as_of; fetched_at hanya menunjukkan waktu pengambilan oleh server.",
     }
 
 @app.get("/api/trend")
