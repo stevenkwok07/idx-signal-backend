@@ -105,12 +105,18 @@ def clear_history_cache():
 def analyze_ticker(ticker: str, force_refresh: bool = False):
     df, fetched_at, provider_metadata = fetch_history(ticker, force_refresh=force_refresh)
     last_bar_date = df.index[-1].date()
-    market_today = pd.Timestamp.now(tz="Asia/Jakarta").date()
-    calendar_days_behind = max(0, (market_today - last_bar_date).days)
+    market_now = pd.Timestamp.now(tz="Asia/Jakarta")
+    market_today = market_now.date()
+    # Candle harian hari ini belum dianggap wajib tersedia sebelum sesi reguler selesai.
+    latest_expected_date = (
+        market_today if market_now.hour >= 16
+        else (market_now - pd.Timedelta(days=1)).date()
+    )
+    calendar_days_behind = max(0, (latest_expected_date - last_bar_date).days)
     business_days_behind = len(pd.bdate_range(
         start=last_bar_date + pd.Timedelta(days=1),
-        end=market_today,
-    )) if last_bar_date < market_today else 0
+        end=latest_expected_date,
+    )) if last_bar_date < latest_expected_date else 0
     stale_suspected = business_days_behind > 1
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
@@ -228,6 +234,7 @@ def analyze_ticker(ticker: str, force_refresh: bool = False):
         "last_bar_timestamp": df.index[-1].isoformat(),
         "fetched_at": fetched_at,
         "data_age_calendar_days": calendar_days_behind,
+        "latest_expected_market_date": latest_expected_date.isoformat(),
         "business_days_behind": business_days_behind,
         "stale_suspected": stale_suspected,
         "data_status": "STALE_SUSPECTED" if stale_suspected else "OK",
