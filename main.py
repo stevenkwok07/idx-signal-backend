@@ -79,18 +79,38 @@ def fetch_history(ticker: str, force_refresh: bool = False):
         raw_metadata = {}
 
     regular_market_time = raw_metadata.get("regularMarketTime")
+    regular_market_time_utc = None
+    regular_market_date = None
+    try:
+        if isinstance(regular_market_time, (int, float)) and regular_market_time > 0:
+            provider_time = pd.Timestamp(regular_market_time, unit="s", tz="UTC")
+            regular_market_time_utc = provider_time.isoformat()
+        elif regular_market_time is not None:
+            provider_time = pd.Timestamp(regular_market_time)
+            if provider_time.tzinfo is None:
+                provider_time = provider_time.tz_localize("Asia/Jakarta")
+            else:
+                provider_time = provider_time.tz_convert("Asia/Jakarta")
+            regular_market_time_utc = provider_time.tz_convert("UTC").isoformat()
+        else:
+            provider_time = None
+
+        if provider_time is not None:
+            regular_market_date = provider_time.tz_convert("Asia/Jakarta").date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        log.warning("Format regularMarketTime tidak dikenali untuk %s: %r", ticker, regular_market_time)
+
     provider_metadata = {
         "currency": raw_metadata.get("currency"),
         "exchange_name": raw_metadata.get("exchangeName"),
         "instrument_type": raw_metadata.get("instrumentType"),
         "exchange_timezone": raw_metadata.get("exchangeTimezoneName"),
         "market_state": raw_metadata.get("marketState"),
-        "regular_market_time": regular_market_time,
-        "regular_market_time_utc": (
-            datetime.fromtimestamp(regular_market_time, timezone.utc).isoformat()
-            if isinstance(regular_market_time, (int, float)) and regular_market_time > 0
-            else None
+        "regular_market_time": (
+            provider_time.isoformat() if provider_time is not None else None
         ),
+        "regular_market_time_utc": regular_market_time_utc,
+        "regular_market_date": regular_market_date,
     }
 
     fetched_at = datetime.now(timezone.utc).isoformat()
@@ -117,7 +137,27 @@ def analyze_ticker(ticker: str, force_refresh: bool = False):
         start=last_bar_date + pd.Timedelta(days=1),
         end=latest_expected_date,
     )) if last_bar_date < latest_expected_date else 0
-    stale_suspected = business_days_behind > 1
+    provider_market_date = provider_metadata.get("regular_market_date")
+    provider_reports_expected_session = (
+        provider_market_date is not None
+        and provider_market_date >= latest_expected_date.isoformat()
+    )
+    history_behind_expected_session = last_bar_date < latest_expected_date
+    stale_suspected = (
+        business_days_behind > 1
+        or (
+            business_days_behind >= 1
+            and history_behind_expected_session
+            and provider_reports_expected_session
+        )
+    )
+    if business_days_behind > 1:
+        stale_reason = "HISTORY_BEHIND_BY_MULTIPLE_BUSINESS_DAYS"
+    elif stale_suspected:
+        stale_reason = "HISTORY_BEHIND_PROVIDER_REPORTED_SESSION"
+    else:
+        stale_reason = None
+
     close = df["Close"].astype(float)
     high = df["High"].astype(float)
     low = df["Low"].astype(float)
@@ -237,6 +277,7 @@ def analyze_ticker(ticker: str, force_refresh: bool = False):
         "latest_expected_market_date": latest_expected_date.isoformat(),
         "business_days_behind": business_days_behind,
         "stale_suspected": stale_suspected,
+        "stale_reason": stale_reason,
         "data_status": "STALE_SUSPECTED" if stale_suspected else "OK",
         "provider_metadata": provider_metadata,
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
@@ -287,13 +328,14 @@ def scan(
         "results": results[:limit],
         "data_as_of": max((x["data_as_of"] for x in results), default=None),
         "oldest_data_as_of": min((x["data_as_of"] for x in results), default=None),
+        "latest_expected_market_date": max((x["latest_expected_market_date"] for x in results), default=None),
         "fetched_at": max((x["fetched_at"] for x in results), default=None),
         "stale_suspected_count": sum(1 for x in results if x["stale_suspected"]),
         "stale_tickers": [x["code"] for x in results if x["stale_suspected"]],
         "data_status": "STALE_SUSPECTED" if any(x["stale_suspected"] for x in results) else "OK",
         "cache_ttl_seconds": CACHE_TTL_SECONDS,
         "refresh_requested": refresh,
-        "note": "STALE_SUSPECTED adalah indikator diagnostik berdasarkan hari kerja, bukan kalender resmi bursa. Periksa provider_metadata dan data_as_of; fetched_at hanya menunjukkan waktu pengambilan oleh server.",
+        "note": "STALE_SUSPECTED dipicu jika histori tertinggal beberapa hari kerja atau tertinggal dari sesi yang dilaporkan metadata provider. Hari kerja bukan kalender resmi bursa. fetched_at hanya menunjukkan waktu pengambilan oleh server.",
     }
 
 @app.get("/api/trend")
